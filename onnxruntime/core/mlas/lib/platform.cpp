@@ -400,6 +400,8 @@ MLAS_INTERNAL_DATA MLAS_DECLSPEC_ALIGN(const uint32_t MlasMaskMoveTableLasx[16],
 #endif
 
 #if defined(MLAS_TARGET_RISCV64) && defined(MLAS_USE_RVV)
+MLAS_GEMM_FLOAT_KERNEL* MlasGetGemmFloatKernelRvv();
+
 namespace {
 
 bool
@@ -500,7 +502,7 @@ Return Value:
         has_rvv = false;
     }
     if (has_rvv) {
-        this->GemmFloatKernel = MlasGemmFloatKernelRvv;
+        this->GemmFloatKernel = MlasGetGemmFloatKernelRvv();
         this->GemmU8S8Dispatch = &MlasGemmQuantDispatchRvv;
         this->GemmU8U8Dispatch = &MlasGemmQuantDispatchRvv;
         this->GemmS8S8Dispatch = &MlasGemmQuantDispatchRvv;

@@ -21,23 +21,70 @@ Abstract:
 
 #include <riscv_vector.h>
 
-namespace {
-
+namespace
+{
 // The packed B layout stays 16 columns wide to match MLAS, but each tile is
 // consumed in runtime-sized RVV chunks so the kernel is not tied to a fixed
 // VLEN such as 128 or 256 bits.
 constexpr size_t kPackedCountN = 16;
 
-template<bool ZeroMode, bool AlphaIsOne>
-MLAS_FORCEINLINE
-void
-MlasStoreAccumulatorRvv(
-    float* C,
-    vfloat32m4_t Accumulator,
-    size_t vl,
-    float alpha
-    )
+template <size_t Lmul>
+struct MlasSgemmRvvTraits;
+
+#define MLAS_SGEMM_RVV_TRAITS(Lmul, Suffix)                                           \
+    template <>                                                                                                 \
+    struct MlasSgemmRvvTraits<Lmul> {                                                                           \
+        using Vector = vfloat32##Suffix##_t;                                                                    \
+                                                                                                                \
+                                                                                                                \
+        static MLAS_FORCEINLINE size_t VectorLength(size_t Count) { return __riscv_vsetvl_e32##Suffix(Count); } \
+                                                                                                                \
+        static MLAS_FORCEINLINE Vector Zero(size_t vl) { return __riscv_vfmv_v_f_f32##Suffix(0.0f, vl); }       \
+                                                                                                                \
+        static MLAS_FORCEINLINE Vector Load(const float* Address, size_t vl)                                    \
+        {                                                                                                       \
+            return __riscv_vle32_v_f32##Suffix(Address, vl);                                                    \
+        }                                                                                                       \
+                                                                                                                \
+        static MLAS_FORCEINLINE void Store(float* Address, Vector Value, size_t vl)                             \
+        {                                                                                                       \
+            __riscv_vse32_v_f32##Suffix(Address, Value, vl);                                                    \
+        }                                                                                                       \
+                                                                                                                \
+        static MLAS_FORCEINLINE Vector Multiply(Vector Value, float Scalar, size_t vl)                          \
+        {                                                                                                       \
+            return __riscv_vfmul_vf_f32##Suffix(Value, Scalar, vl);                                             \
+        }                                                                                                       \
+                                                                                                                \
+        static MLAS_FORCEINLINE Vector Add(Vector Left, Vector Right, size_t vl)                                \
+        {                                                                                                       \
+            return __riscv_vfadd_vv_f32##Suffix(Left, Right, vl);                                               \
+        }                                                                                                       \
+                                                                                                                \
+        static MLAS_FORCEINLINE Vector MultiplyAdd(Vector Accumulator, float Scalar, Vector Value, size_t vl)   \
+        {                                                                                                       \
+            return __riscv_vfmacc_vf_f32##Suffix(Accumulator, Scalar, Value, vl);                               \
+        }                                                                                                       \
+    }
+
+MLAS_SGEMM_RVV_TRAITS(1, m1);
+MLAS_SGEMM_RVV_TRAITS(2, m2);
+MLAS_SGEMM_RVV_TRAITS(4, m4);
+
+#undef MLAS_SGEMM_RVV_TRAITS
+
+#if defined(__GNUC__)
+#define MLAS_SGEMM_RVV_NOINLINE __attribute__((noinline))
+#else
+#define MLAS_SGEMM_RVV_NOINLINE
+#endif
+
+template <size_t Lmul, bool ZeroMode, bool AlphaIsOne>
+MLAS_FORCEINLINE void
+MlasStoreAccumulatorRvv(float* C, typename MlasSgemmRvvTraits<Lmul>::Vector Accumulator, size_t vl, float alpha)
 {
+    using Traits = MlasSgemmRvvTraits<Lmul>;
+
 #if defined(_WIN32)
 
     if constexpr (AlphaIsOne) {
@@ -47,30 +94,25 @@ MlasStoreAccumulatorRvv(
 #endif
 
     if constexpr (!AlphaIsOne) {
-        Accumulator = __riscv_vfmul_vf_f32m4(Accumulator, alpha, vl);
+        Accumulator = Traits::Multiply(Accumulator, alpha, vl);
     }
 
     if constexpr (!ZeroMode) {
-        Accumulator = __riscv_vfadd_vv_f32m4(Accumulator, __riscv_vle32_v_f32m4(C, vl), vl);
+        Accumulator = Traits::Add(Accumulator, Traits::Load(C, vl), vl);
     }
 
-    __riscv_vse32_v_f32m4(C, Accumulator, vl);
+    Traits::Store(C, Accumulator, vl);
 }
 
-template<bool ZeroMode, bool AlphaIsOne, size_t Rows>
-MLAS_FORCEINLINE
-size_t
-MlasSgemmKernelRvv(
-    const float* A,
-    const float* B,
-    float* C,
-    size_t CountK,
-    size_t CountN,
-    size_t lda,
-    size_t ldc,
-    float alpha
-    )
+template <size_t Lmul, bool ZeroMode, bool AlphaIsOne, size_t Rows>
+MLAS_FORCEINLINE void
+MlasSgemmTileRvv(
+    const float* A, const float* B, float* C, size_t CountK, size_t CountN, size_t lda, size_t ldc, float alpha
+)
+
 {
+    using Traits = MlasSgemmRvvTraits<Lmul>;
+
     static_assert(Rows >= 1 && Rows <= 4, "unsupported RVV SGEMM tile height");
 
 #if defined(_WIN32)
@@ -86,104 +128,117 @@ MlasSgemmKernelRvv(
 
 #endif
 
+    using Vector = typename Traits::Vector;
+
+    size_t remaining_n_block = CountN;
+    size_t column_offset = 0;
+    float* c = C;
+
+    while (remaining_n_block > 0) {
+        const size_t vl = Traits::VectorLength(remaining_n_block);
+
+        Vector row0_block = Traits::Zero(vl);
+        Vector row1_block;
+        Vector row2_block;
+        Vector row3_block;
+
+        if constexpr (Rows >= 2) {
+            row1_block = Traits::Zero(vl);
+        }
+        if constexpr (Rows >= 3) {
+            row2_block = Traits::Zero(vl);
+        }
+        if constexpr (Rows >= 4) {
+            row3_block = Traits::Zero(vl);
+        }
+
+        const float* a = A;
+        const float* b = B + column_offset;
+        size_t k = CountK;
+
+        while (k >= 2) {
+            const float row0_a0 = a[lda * 0 + 0];
+            const float row0_a1 = a[lda * 0 + 1];
+            Vector b_elements = Traits::Load(b, vl);
+            row0_block = Traits::MultiplyAdd(row0_block, row0_a0, b_elements, vl);
+
+            if constexpr (Rows >= 2) {
+                row1_block = Traits::MultiplyAdd(row1_block, a[lda * 1 + 0], b_elements, vl);
+            }
+            if constexpr (Rows >= 3) {
+                row2_block = Traits::MultiplyAdd(row2_block, a[lda * 2 + 0], b_elements, vl);
+            }
+            if constexpr (Rows >= 4) {
+                row3_block = Traits::MultiplyAdd(row3_block, a[lda * 3 + 0], b_elements, vl);
+            }
+
+            b_elements = Traits::Load(b + kPackedCountN, vl);
+            row0_block = Traits::MultiplyAdd(row0_block, row0_a1, b_elements, vl);
+
+            if constexpr (Rows >= 2) {
+                row1_block = Traits::MultiplyAdd(row1_block, a[lda * 1 + 1], b_elements, vl);
+            }
+            if constexpr (Rows >= 3) {
+                row2_block = Traits::MultiplyAdd(row2_block, a[lda * 2 + 1], b_elements, vl);
+            }
+            if constexpr (Rows >= 4) {
+                row3_block = Traits::MultiplyAdd(row3_block, a[lda * 3 + 1], b_elements, vl);
+            }
+
+            a += 2;
+            b += kPackedCountN * 2;
+            k -= 2;
+        }
+
+        if (k > 0) {
+            Vector b_elements = Traits::Load(b, vl);
+            row0_block = Traits::MultiplyAdd(row0_block, a[lda * 0 + 0], b_elements, vl);
+
+            if constexpr (Rows >= 2) {
+                row1_block = Traits::MultiplyAdd(row1_block, a[lda * 1 + 0], b_elements, vl);
+            }
+            if constexpr (Rows >= 3) {
+                row2_block = Traits::MultiplyAdd(row2_block, a[lda * 2 + 0], b_elements, vl);
+            }
+            if constexpr (Rows >= 4) {
+                row3_block = Traits::MultiplyAdd(row3_block, a[lda * 3 + 0], b_elements, vl);
+            }
+        }
+
+        MlasStoreAccumulatorRvv<Lmul, ZeroMode, AlphaIsOne>(c, row0_block, vl, alpha);
+
+        if constexpr (Rows >= 2) {
+            MlasStoreAccumulatorRvv<Lmul, ZeroMode, AlphaIsOne>(c + ldc, row1_block, vl, alpha);
+        }
+        if constexpr (Rows >= 3) {
+            MlasStoreAccumulatorRvv<Lmul, ZeroMode, AlphaIsOne>(c + ldc * 2, row2_block, vl, alpha);
+        }
+        if constexpr (Rows >= 4) {
+            MlasStoreAccumulatorRvv<Lmul, ZeroMode, AlphaIsOne>(c + ldc * 3, row3_block, vl, alpha);
+        }
+
+        c += vl;
+        column_offset += vl;
+        remaining_n_block -= vl;
+    }
+}
+
+template <size_t Lmul, bool ZeroMode, bool AlphaIsOne, size_t Rows>
+MLAS_FORCEINLINE size_t
+MlasSgemmKernelRvv(
+    const float* A, const float* B, float* C, size_t CountK, size_t CountN, size_t lda, size_t ldc, float alpha
+)
+{
     const float* packed_b_block = B;
     float* c_block = C;
     size_t remaining_n_total = CountN;
 
     do {
         const size_t count_n_block = remaining_n_total >= kPackedCountN ? kPackedCountN : remaining_n_total;
-        size_t remaining_n_block = count_n_block;
-        size_t column_offset = 0;
-        float* c = c_block;
 
-        while (remaining_n_block > 0) {
-            // Split a packed 16-column tile into however many lanes the current
-            // machine exposes for e32,m4. This keeps the kernel VLEN-agnostic.
-            const size_t vl = __riscv_vsetvl_e32m4(remaining_n_block);
-            vfloat32m4_t row0_block = __riscv_vfmv_v_f_f32m4(0.0f, vl);
-            vfloat32m4_t row1_block;
-            vfloat32m4_t row2_block;
-            vfloat32m4_t row3_block;
-
-            if constexpr (Rows >= 2) {
-                row1_block = __riscv_vfmv_v_f_f32m4(0.0f, vl);
-            }
-            if constexpr (Rows >= 3) {
-                row2_block = __riscv_vfmv_v_f_f32m4(0.0f, vl);
-            }
-            if constexpr (Rows >= 4) {
-                row3_block = __riscv_vfmv_v_f_f32m4(0.0f, vl);
-            }
-
-            const float* a = A;
-            const float* b = packed_b_block + column_offset;
-            size_t k = CountK;
-
-            while (k >= 2) {
-                const float row0_a0 = a[0];
-                const float row0_a1 = a[1];
-                vfloat32m4_t b_elements = __riscv_vle32_v_f32m4(b, vl);
-                row0_block = __riscv_vfmacc_vf_f32m4(row0_block, row0_a0, b_elements, vl);
-
-                if constexpr (Rows >= 2) {
-                    row1_block = __riscv_vfmacc_vf_f32m4(row1_block, a[lda], b_elements, vl);
-                }
-                if constexpr (Rows >= 3) {
-                    row2_block = __riscv_vfmacc_vf_f32m4(row2_block, a[lda * 2], b_elements, vl);
-                }
-                if constexpr (Rows >= 4) {
-                    row3_block = __riscv_vfmacc_vf_f32m4(row3_block, a[lda * 3], b_elements, vl);
-                }
-
-                b_elements = __riscv_vle32_v_f32m4(b + kPackedCountN, vl);
-                row0_block = __riscv_vfmacc_vf_f32m4(row0_block, row0_a1, b_elements, vl);
-
-                if constexpr (Rows >= 2) {
-                    row1_block = __riscv_vfmacc_vf_f32m4(row1_block, a[lda + 1], b_elements, vl);
-                }
-                if constexpr (Rows >= 3) {
-                    row2_block = __riscv_vfmacc_vf_f32m4(row2_block, a[lda * 2 + 1], b_elements, vl);
-                }
-                if constexpr (Rows >= 4) {
-                    row3_block = __riscv_vfmacc_vf_f32m4(row3_block, a[lda * 3 + 1], b_elements, vl);
-                }
-
-                a += 2;
-                b += kPackedCountN * 2;
-                k -= 2;
-            }
-
-            if (k > 0) {
-                vfloat32m4_t b_elements = __riscv_vle32_v_f32m4(b, vl);
-                row0_block = __riscv_vfmacc_vf_f32m4(row0_block, a[0], b_elements, vl);
-
-                if constexpr (Rows >= 2) {
-                    row1_block = __riscv_vfmacc_vf_f32m4(row1_block, a[lda], b_elements, vl);
-                }
-                if constexpr (Rows >= 3) {
-                    row2_block = __riscv_vfmacc_vf_f32m4(row2_block, a[lda * 2], b_elements, vl);
-                }
-                if constexpr (Rows >= 4) {
-                    row3_block = __riscv_vfmacc_vf_f32m4(row3_block, a[lda * 3], b_elements, vl);
-                }
-            }
-
-            MlasStoreAccumulatorRvv<ZeroMode, AlphaIsOne>(c, row0_block, vl, alpha);
-
-            if constexpr (Rows >= 2) {
-                MlasStoreAccumulatorRvv<ZeroMode, AlphaIsOne>(c + ldc, row1_block, vl, alpha);
-            }
-            if constexpr (Rows >= 3) {
-                MlasStoreAccumulatorRvv<ZeroMode, AlphaIsOne>(c + ldc * 2, row2_block, vl, alpha);
-            }
-            if constexpr (Rows >= 4) {
-                MlasStoreAccumulatorRvv<ZeroMode, AlphaIsOne>(c + ldc * 3, row3_block, vl, alpha);
-            }
-
-            c += vl;
-            column_offset += vl;
-            remaining_n_block -= vl;
-        }
+        MlasSgemmTileRvv<Lmul, ZeroMode, AlphaIsOne, Rows>(
+            A, packed_b_block, c_block, CountK, count_n_block, lda, ldc, alpha
+        );
 
         c_block += count_n_block;
         packed_b_block += CountK * kPackedCountN;
@@ -194,9 +249,8 @@ MlasSgemmKernelRvv(
     return Rows;
 }
 
-template<bool ZeroMode, bool AlphaIsOne>
-MLAS_FORCEINLINE
-size_t
+template <size_t Lmul, bool ZeroMode, bool AlphaIsOne>
+MLAS_FORCEINLINE size_t
 MlasGemmFloatKernelRvvDispatchRows(
     const float* A,
     const float* B,
@@ -207,27 +261,26 @@ MlasGemmFloatKernelRvvDispatchRows(
     size_t lda,
     size_t ldc,
     float alpha
-    )
+)
 {
     if (CountM >= 4) {
-        return MlasSgemmKernelRvv<ZeroMode, AlphaIsOne, 4>(A, B, C, CountK, CountN, lda, ldc, alpha);
+        return MlasSgemmKernelRvv<Lmul, ZeroMode, AlphaIsOne, 4>(A, B, C, CountK, CountN, lda, ldc, alpha);
     }
 
     if (CountM == 3) {
-        return MlasSgemmKernelRvv<ZeroMode, AlphaIsOne, 3>(A, B, C, CountK, CountN, lda, ldc, alpha);
+        return MlasSgemmKernelRvv<Lmul, ZeroMode, AlphaIsOne, 3>(A, B, C, CountK, CountN, lda, ldc, alpha);
     }
 
     if (CountM >= 2) {
-        return MlasSgemmKernelRvv<ZeroMode, AlphaIsOne, 2>(A, B, C, CountK, CountN, lda, ldc, alpha);
+        return MlasSgemmKernelRvv<Lmul, ZeroMode, AlphaIsOne, 2>(A, B, C, CountK, CountN, lda, ldc, alpha);
     }
 
-    return MlasSgemmKernelRvv<ZeroMode, AlphaIsOne, 1>(A, B, C, CountK, CountN, lda, ldc, alpha);
+    return MlasSgemmKernelRvv<Lmul, ZeroMode, AlphaIsOne, 1>(A, B, C, CountK, CountN, lda, ldc, alpha);
 }
 
-template<bool ZeroMode>
-MLAS_FORCEINLINE
-size_t
-MlasGemmFloatKernelRvvDispatch(
+template <size_t Lmul, bool ZeroMode>
+MLAS_FORCEINLINE size_t
+MlasGemmFloatKernelRvvDispatchAlpha(
     const float* A,
     const float* B,
     float* C,
@@ -237,21 +290,108 @@ MlasGemmFloatKernelRvvDispatch(
     size_t lda,
     size_t ldc,
     float alpha
-    )
+)
 {
     if (alpha == 1.0f) {
-        return MlasGemmFloatKernelRvvDispatchRows<ZeroMode, true>(
-            A, B, C, CountK, CountM, CountN, lda, ldc, alpha);
+        return MlasGemmFloatKernelRvvDispatchRows<Lmul, ZeroMode, true>(
+            A, B, C, CountK, CountM, CountN, lda, ldc, alpha
+        );
     }
 
-    return MlasGemmFloatKernelRvvDispatchRows<ZeroMode, false>(
-        A, B, C, CountK, CountM, CountN, lda, ldc, alpha);
+    return MlasGemmFloatKernelRvvDispatchRows<Lmul, ZeroMode, false>(
+        A, B, C, CountK, CountM, CountN, lda, ldc, alpha
+    );
+}
+
+template <size_t Lmul>
+MLAS_FORCEINLINE size_t
+MlasGemmFloatKernelRvvImpl(
+    const float* A,
+    const float* B,
+    float* C,
+    size_t CountK,
+    size_t CountM,
+    size_t CountN,
+    size_t lda,
+    size_t ldc,
+    float alpha,
+    bool ZeroMode
+)
+{
+    if (ZeroMode) {
+        return MlasGemmFloatKernelRvvDispatchAlpha<Lmul, true>(A, B, C, CountK, CountM, CountN, lda, ldc, alpha);
+    }
+
+    return MlasGemmFloatKernelRvvDispatchAlpha<Lmul, false>(A, B, C, CountK, CountM, CountN, lda, ldc, alpha);
+}
+
+MLAS_SGEMM_RVV_NOINLINE size_t
+MlasGemmFloatKernelSingleRowRvv(
+    const float* A,
+    const float* B,
+    float* C,
+    size_t CountK,
+    size_t CountN,
+    size_t lda,
+    size_t ldc,
+    float alpha,
+    bool ZeroMode
+)
+{
+    return MlasGemmFloatKernelRvvImpl<4>(A, B, C, CountK, 1, CountN, lda, ldc, alpha, ZeroMode);
+}
+
+#define MLAS_SGEMM_RVV_ENTRY(EntryName, Lmul)                                                                          \
+    MLAS_SGEMM_RVV_NOINLINE size_t MLASCALL EntryName(                                                                 \
+        const float* A, const float* B, float* C, size_t CountK, size_t CountM, size_t CountN, size_t lda, size_t ldc, \
+        float alpha, bool ZeroMode                                                                                     \
+    )                                                                                                                  \
+    {                                                                                                                  \
+        if constexpr (Lmul != 4) {                                                                                     \
+            if (CountM == 1) {                                                                                          \
+                return MlasGemmFloatKernelSingleRowRvv(A, B, C, CountK, CountN, lda, ldc, alpha, ZeroMode);              \
+            }                                                                                                          \
+        }                                                                                                              \
+        return MlasGemmFloatKernelRvvImpl<Lmul>(A, B, C, CountK, CountM, CountN, lda, ldc, alpha, ZeroMode);           \
+    }
+
+MLAS_SGEMM_RVV_ENTRY(MlasGemmFloatKernelRvvM1, 1)
+MLAS_SGEMM_RVV_ENTRY(MlasGemmFloatKernelRvvM2, 2)
+MLAS_SGEMM_RVV_ENTRY(MlasGemmFloatKernelRvvM4, 4)
+
+#undef MLAS_SGEMM_RVV_ENTRY
+
+MLAS_FORCEINLINE size_t
+MlasSgemmLmulRvv()
+{
+    const size_t BlockBytes = kPackedCountN * sizeof(float);
+    const size_t RegisterBytes = __riscv_vlenb();
+
+    if (RegisterBytes >= BlockBytes) {
+        return 1;
+    }
+    if (2 * RegisterBytes >= BlockBytes) {
+        return 2;
+    }
+    return 4;
 }
 
 }  // namespace
 
-size_t
-MLASCALL
+MLAS_GEMM_FLOAT_KERNEL*
+MlasGetGemmFloatKernelRvv()
+{
+    switch (MlasSgemmLmulRvv()) {
+        case 1:
+            return MlasGemmFloatKernelRvvM1;
+        case 2:
+            return MlasGemmFloatKernelRvvM2;
+        default:
+            return MlasGemmFloatKernelRvvM4;
+    }
+}
+
+size_t MLASCALL
 MlasGemmFloatKernelRvv(
     const float* A,
     const float* B,
@@ -263,13 +403,10 @@ MlasGemmFloatKernelRvv(
     size_t ldc,
     float alpha,
     bool ZeroMode
-    )
+)
 {
-    if (ZeroMode) {
-        return MlasGemmFloatKernelRvvDispatch<true>(A, B, C, CountK, CountM, CountN, lda, ldc, alpha);
-    }
-
-    return MlasGemmFloatKernelRvvDispatch<false>(A, B, C, CountK, CountM, CountN, lda, ldc, alpha);
+    return MlasGetGemmFloatKernelRvv()(A, B, C, CountK, CountM, CountN, lda, ldc, alpha, ZeroMode);
 }
 
+#undef MLAS_SGEMM_RVV_NOINLINE
 #endif  // defined(MLAS_USE_RVV)
