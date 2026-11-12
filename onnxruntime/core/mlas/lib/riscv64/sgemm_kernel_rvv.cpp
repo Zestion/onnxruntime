@@ -31,11 +31,16 @@ constexpr size_t kPackedCountN = 16;
 template <size_t Lmul>
 struct MlasSgemmRvvTraits;
 
-#define MLAS_SGEMM_RVV_TRAITS(Lmul, Suffix)                                           \
+#define MLAS_SGEMM_RVV_TRAITS(Lmul, Suffix, MaxTileRows, KStepUnroll)                                           \
     template <>                                                                                                 \
     struct MlasSgemmRvvTraits<Lmul> {                                                                           \
         using Vector = vfloat32##Suffix##_t;                                                                    \
                                                                                                                 \
+        static constexpr size_t MaxRows = MaxTileRows;                                                          \
+                                                                                                                \
+        static constexpr size_t KUnroll = KStepUnroll;                                                          \
+                                                                                                                \
+        static MLAS_FORCEINLINE size_t MaxVectorLength() { return __riscv_vsetvlmax_e32##Suffix(); }            \
                                                                                                                 \
         static MLAS_FORCEINLINE size_t VectorLength(size_t Count) { return __riscv_vsetvl_e32##Suffix(Count); } \
                                                                                                                 \
@@ -67,9 +72,10 @@ struct MlasSgemmRvvTraits;
         }                                                                                                       \
     }
 
-MLAS_SGEMM_RVV_TRAITS(1, m1);
-MLAS_SGEMM_RVV_TRAITS(2, m2);
-MLAS_SGEMM_RVV_TRAITS(4, m4);
+// Use the same seven-row cap for all LMULs while retaining the K policy.
+MLAS_SGEMM_RVV_TRAITS(1, m1, 7, 2);
+MLAS_SGEMM_RVV_TRAITS(2, m2, 7, 2);
+MLAS_SGEMM_RVV_TRAITS(4, m4, 7, 1);
 
 #undef MLAS_SGEMM_RVV_TRAITS
 
@@ -113,7 +119,8 @@ MlasSgemmTileRvv(
 {
     using Traits = MlasSgemmRvvTraits<Lmul>;
 
-    static_assert(Rows >= 1 && Rows <= 4, "unsupported RVV SGEMM tile height");
+    static_assert(Rows >= 1 && Rows <= 7, "unsupported RVV SGEMM tile height");
+    static_assert(Rows <= Traits::MaxRows, "tile height exceeds the register budget measured for this LMUL");
 
 #if defined(_WIN32)
 
@@ -141,6 +148,9 @@ MlasSgemmTileRvv(
         Vector row1_block;
         Vector row2_block;
         Vector row3_block;
+        Vector row4_block;
+        Vector row5_block;
+        Vector row6_block;
 
         if constexpr (Rows >= 2) {
             row1_block = Traits::Zero(vl);
@@ -151,12 +161,22 @@ MlasSgemmTileRvv(
         if constexpr (Rows >= 4) {
             row3_block = Traits::Zero(vl);
         }
+        if constexpr (Rows >= 5) {
+            row4_block = Traits::Zero(vl);
+        }
+        if constexpr (Rows >= 6) {
+            row5_block = Traits::Zero(vl);
+        }
+        if constexpr (Rows >= 7) {
+            row6_block = Traits::Zero(vl);
+        }
 
         const float* a = A;
         const float* b = B + column_offset;
         size_t k = CountK;
 
-        while (k >= 2) {
+        // Preserve K2 for the original row tiles; larger m4 tiles use K1.
+        while ((Traits::KUnroll == 2 || Rows <= 4) && k >= 2) {
             const float row0_a0 = a[lda * 0 + 0];
             const float row0_a1 = a[lda * 0 + 1];
             Vector b_elements = Traits::Load(b, vl);
@@ -171,6 +191,15 @@ MlasSgemmTileRvv(
             if constexpr (Rows >= 4) {
                 row3_block = Traits::MultiplyAdd(row3_block, a[lda * 3 + 0], b_elements, vl);
             }
+            if constexpr (Rows >= 5) {
+                row4_block = Traits::MultiplyAdd(row4_block, a[lda * 4 + 0], b_elements, vl);
+            }
+            if constexpr (Rows >= 6) {
+                row5_block = Traits::MultiplyAdd(row5_block, a[lda * 5 + 0], b_elements, vl);
+            }
+            if constexpr (Rows >= 7) {
+                row6_block = Traits::MultiplyAdd(row6_block, a[lda * 6 + 0], b_elements, vl);
+            }
 
             b_elements = Traits::Load(b + kPackedCountN, vl);
             row0_block = Traits::MultiplyAdd(row0_block, row0_a1, b_elements, vl);
@@ -184,13 +213,22 @@ MlasSgemmTileRvv(
             if constexpr (Rows >= 4) {
                 row3_block = Traits::MultiplyAdd(row3_block, a[lda * 3 + 1], b_elements, vl);
             }
+            if constexpr (Rows >= 5) {
+                row4_block = Traits::MultiplyAdd(row4_block, a[lda * 4 + 1], b_elements, vl);
+            }
+            if constexpr (Rows >= 6) {
+                row5_block = Traits::MultiplyAdd(row5_block, a[lda * 5 + 1], b_elements, vl);
+            }
+            if constexpr (Rows >= 7) {
+                row6_block = Traits::MultiplyAdd(row6_block, a[lda * 6 + 1], b_elements, vl);
+            }
 
             a += 2;
             b += kPackedCountN * 2;
             k -= 2;
         }
 
-        if (k > 0) {
+        while (k > 0) {
             Vector b_elements = Traits::Load(b, vl);
             row0_block = Traits::MultiplyAdd(row0_block, a[lda * 0 + 0], b_elements, vl);
 
@@ -203,6 +241,19 @@ MlasSgemmTileRvv(
             if constexpr (Rows >= 4) {
                 row3_block = Traits::MultiplyAdd(row3_block, a[lda * 3 + 0], b_elements, vl);
             }
+            if constexpr (Rows >= 5) {
+                row4_block = Traits::MultiplyAdd(row4_block, a[lda * 4 + 0], b_elements, vl);
+            }
+            if constexpr (Rows >= 6) {
+                row5_block = Traits::MultiplyAdd(row5_block, a[lda * 5 + 0], b_elements, vl);
+            }
+            if constexpr (Rows >= 7) {
+                row6_block = Traits::MultiplyAdd(row6_block, a[lda * 6 + 0], b_elements, vl);
+            }
+
+            a += 1;
+            b += kPackedCountN;
+            k -= 1;
         }
 
         MlasStoreAccumulatorRvv<Lmul, ZeroMode, AlphaIsOne>(c, row0_block, vl, alpha);
@@ -216,6 +267,15 @@ MlasSgemmTileRvv(
         if constexpr (Rows >= 4) {
             MlasStoreAccumulatorRvv<Lmul, ZeroMode, AlphaIsOne>(c + ldc * 3, row3_block, vl, alpha);
         }
+        if constexpr (Rows >= 5) {
+            MlasStoreAccumulatorRvv<Lmul, ZeroMode, AlphaIsOne>(c + ldc * 4, row4_block, vl, alpha);
+        }
+        if constexpr (Rows >= 6) {
+            MlasStoreAccumulatorRvv<Lmul, ZeroMode, AlphaIsOne>(c + ldc * 5, row5_block, vl, alpha);
+        }
+        if constexpr (Rows >= 7) {
+            MlasStoreAccumulatorRvv<Lmul, ZeroMode, AlphaIsOne>(c + ldc * 6, row6_block, vl, alpha);
+        }
 
         c += vl;
         column_offset += vl;
@@ -224,11 +284,34 @@ MlasSgemmTileRvv(
 }
 
 template <size_t Lmul, bool ZeroMode, bool AlphaIsOne, size_t Rows>
+MLAS_SGEMM_RVV_NOINLINE void
+MlasSgemmTailBlockRvv(
+    const float* A, const float* B, float* C, size_t CountK, size_t CountN, size_t lda, size_t ldc, float alpha
+)
+
+{
+    if constexpr (Lmul > 1) {
+        using Narrow = MlasSgemmRvvTraits<Lmul / 2>;
+
+        if constexpr (Rows <= Narrow::MaxRows) {
+            if (CountN <= Narrow::MaxVectorLength()) {
+                MlasSgemmTailBlockRvv<Lmul / 2, ZeroMode, AlphaIsOne, Rows>(A, B, C, CountK, CountN, lda, ldc, alpha);
+                return;
+            }
+        }
+    }
+
+    MlasSgemmTileRvv<Lmul, ZeroMode, AlphaIsOne, Rows>(A, B, C, CountK, CountN, lda, ldc, alpha);
+}
+
+template <size_t Lmul, bool ZeroMode, bool AlphaIsOne, size_t Rows>
 MLAS_FORCEINLINE size_t
 MlasSgemmKernelRvv(
     const float* A, const float* B, float* C, size_t CountK, size_t CountN, size_t lda, size_t ldc, float alpha
 )
 {
+    using Traits = MlasSgemmRvvTraits<Lmul>;
+
     const float* packed_b_block = B;
     float* c_block = C;
     size_t remaining_n_total = CountN;
@@ -236,9 +319,22 @@ MlasSgemmKernelRvv(
     do {
         const size_t count_n_block = remaining_n_total >= kPackedCountN ? kPackedCountN : remaining_n_total;
 
-        MlasSgemmTileRvv<Lmul, ZeroMode, AlphaIsOne, Rows>(
-            A, packed_b_block, c_block, CountK, count_n_block, lda, ldc, alpha
-        );
+        bool diverted = false;
+
+        if constexpr (Rows == Traits::MaxRows) {
+            if (count_n_block < kPackedCountN) {
+                MlasSgemmTailBlockRvv<Lmul, ZeroMode, AlphaIsOne, Rows>(
+                    A, packed_b_block, c_block, CountK, count_n_block, lda, ldc, alpha
+                );
+                diverted = true;
+            }
+        }
+
+        if (!diverted) {
+            MlasSgemmTileRvv<Lmul, ZeroMode, AlphaIsOne, Rows>(
+                A, packed_b_block, c_block, CountK, count_n_block, lda, ldc, alpha
+            );
+        }
 
         c_block += count_n_block;
         packed_b_block += CountK * kPackedCountN;
@@ -263,7 +359,24 @@ MlasGemmFloatKernelRvvDispatchRows(
     float alpha
 )
 {
-    if (CountM >= 4) {
+    using Traits = MlasSgemmRvvTraits<Lmul>;
+
+
+    if constexpr (Traits::MaxRows >= 7) {
+        if (CountM >= 7) {
+            return MlasSgemmKernelRvv<Lmul, ZeroMode, AlphaIsOne, 7>(A, B, C, CountK, CountN, lda, ldc, alpha);
+        }
+    }
+
+    if (CountM >= 6) {
+        return MlasSgemmKernelRvv<Lmul, ZeroMode, AlphaIsOne, 6>(A, B, C, CountK, CountN, lda, ldc, alpha);
+    }
+
+    if (CountM == 5) {
+        return MlasSgemmKernelRvv<Lmul, ZeroMode, AlphaIsOne, 5>(A, B, C, CountK, CountN, lda, ldc, alpha);
+    }
+
+    if (CountM == 4) {
         return MlasSgemmKernelRvv<Lmul, ZeroMode, AlphaIsOne, 4>(A, B, C, CountK, CountN, lda, ldc, alpha);
     }
 
